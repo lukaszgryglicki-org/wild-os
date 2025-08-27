@@ -79,19 +79,10 @@ pm32_entry:
     mov edi, 0x2000
     mov dword [edi], 0x3003
     mov dword [edi+4], 0
-    ; PD entries: 512 * 2 MiB
+    ; PD[0] = one 2MiB page mapping 0..2MiB (P|RW|PS, base=0)
     mov edi, 0x3000
-    xor eax, eax
-    mov ecx, 512
-.pm32_pd_loop:
-    mov ebx, eax
-    shl ebx, 21                ; base = i * 2MiB
-    or  ebx, 0x083             ; P|RW|PS
-    mov dword [edi], ebx
+    mov dword [edi], 0x0083
     mov dword [edi+4], 0
-    add edi, 8
-    inc eax
-    loop .pm32_pd_loop
 
     ; Enable PAE, load CR3 with PML4
     mov eax, cr4
