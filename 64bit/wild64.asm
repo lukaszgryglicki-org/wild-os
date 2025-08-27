@@ -139,11 +139,11 @@ lm64_entry:
     mov rsi, 0x123456789ABCDEF0
 .seeded:
 
-    mov rbx, 2000               ; 80*25 cells
+    mov rbx, 1997               ; 80*25-3 (RPL) cells
 
 .main_loop:
     mov rcx, rbx
-    mov rdi, 0xB8000
+    mov rdi, 0xB8006
 .fill_loop:
     ; xorshift64 in RSI (small & fast)
     mov rax, rsi
