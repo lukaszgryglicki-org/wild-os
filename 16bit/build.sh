@@ -1,2 +1,2 @@
 #!/bin/bash
-nasm -f bin boot64.asm -o boot64.img
+nasm -f bin boot16.asm -o boot16.img
