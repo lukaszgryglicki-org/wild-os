@@ -1,6 +1,7 @@
 ; wild_uefi.asm — UEFI x86-64
-; Robustly find GOP (LocateProtocol first), SetMode(current), QueryMode(current),
-; then fill the entire screen with a new random color every frame using BLT.
+; Robust GOP init (LocateProtocol → SetMode → QueryMode),
+; then fill the screen with **per‑pixel random colors** forever using
+; GOP->Blt(BufferToVideo) one scanline at a time.
 ;
 ; Build:
 ;   nasm -f win64 wild_uefi.asm -o wild_uefi.obj
@@ -39,7 +40,7 @@
 %define INFO_VRES               0x08        ; UINT32
 
 ; EFI_GRAPHICS_OUTPUT_BLT_OPERATION
-%define EfiBltVideoFill         0
+%define EfiBltBufferToVideo     2
 
 ; -------------- tiny helpers --------------
 ; put UTF-16 string at RDX
@@ -51,7 +52,7 @@ putws:
         add     rsp, 32
         ret
 
-; put one UTF-16 character in AL
+; put one UTF-16 character from AL
 putch:
         mov     [chbuf], al
         lea     rdx, [rel chbuf]
@@ -166,6 +167,11 @@ efi_main:
         mov     eax, [rbx+INFO_VRES]
         mov     [height], eax
 
+        ; rowbytes = width * 4 (32bpp)
+        mov     eax, [width]
+        shl     eax, 2
+        mov     [rowbytes], eax
+
         ; seed RNG (xorshift64)
         rdtsc
         shl     rdx, 32
@@ -176,9 +182,18 @@ efi_main:
 .seed_ok:
         mov     [rng_state], rax
 
+; ======================= per‑pixel noise via scanline BLT ====================
 .frame:
-        ; xorshift64 step
-        mov     rax, [rng_state]
+        mov     dword [cur_y], 0           ; y = 0
+
+.y_loop:
+        ; ---- Build one scanline of random pixels into rowbuf ----
+        mov     ecx, [width]               ; number of dwords this row
+        lea     rdi, [rel rowbuf]
+        mov     rax, [rng_state]           ; local RNG state in RAX
+
+.fill_row:
+        ; xorshift64*
         mov     rdx, rax
         shl     rax, 13
         xor     rax, rdx
@@ -188,28 +203,39 @@ efi_main:
         mov     rdx, rax
         shl     rax, 17
         xor     rax, rdx
-        mov     [rng_state], rax
 
-        mov     eax, dword [rng_state]     ; pixel (B,G,R,Resv)
-        mov     dword [bltpix], eax
+        ; write low 32 bits as pixel (B,G,R,Reserved)
+        stosd
+        dec     ecx
+        jnz     .fill_row
 
-        ; BLT: VideoFill full screen
-        sub     rsp, 80                    ; 32 shadow + 6 qwords
+        mov     [rng_state], rax           ; persist RNG
+
+        ; ---- BLT this row to (0, y): Width x 1, Delta = rowbytes ----
+        ; RCX=this(GOP*), RDX=&rowbuf, R8=2(BufferToVideo), R9=SourceX=0
+        ; Stack (after 32B shadow):
+        ;   [rsp+32] = SourceY = 0
+        ;   [rsp+40] = DestX   = 0
+        ;   [rsp+48] = DestY   = y
+        ;   [rsp+56] = Width   = width
+        ;   [rsp+64] = Height  = 1
+        ;   [rsp+72] = Delta   = rowbytes
+        sub     rsp, 80
         xor     rax, rax
-        mov     [rsp+32], rax              ; SourceY=0
-        mov     [rsp+40], rax              ; DestX=0
-        mov     [rsp+48], rax              ; DestY=0
+        mov     [rsp+32], rax
+        mov     [rsp+40], rax
+        mov     eax, [cur_y]
+        mov     [rsp+48], rax
         mov     eax, [width]
-        mov     [rsp+56], rax              ; Width
-        mov     eax, [height]
-        mov     [rsp+64], rax              ; Height
-        xor     rax, rax
-        mov     [rsp+72], rax              ; Delta=0
+        mov     [rsp+56], rax
+        mov     qword [rsp+64], 1
+        mov     eax, [rowbytes]
+        mov     [rsp+72], rax
 
-        mov     rcx, r12                   ; this
-        lea     rdx, [rel bltpix]          ; BltBuffer
-        mov     r8d, EfiBltVideoFill
-        xor     r9d, r9d                   ; SourceX=0
+        mov     rcx, r12                   ; GOP*
+        lea     rdx, [rel rowbuf]          ; BltBuffer
+        mov     r8d, EfiBltBufferToVideo
+        xor     r9d, r9d                   ; SourceX = 0
         mov     rax, [rcx+GOP_BLT]
         call    rax
         add     rsp, 80
@@ -222,7 +248,13 @@ efi_main:
         mov     byte [blt_mark], 1
 .skip_mark:
 
-        jmp     .frame                     ; forever
+        ; next scanline
+        inc     dword [cur_y]
+        mov     eax, [cur_y]
+        cmp     eax, [height]
+        jb      .y_loop
+
+        jmp     .frame                     ; next “frame” (new random pixels)
 
 .hang:
         jmp     .hang
@@ -236,9 +268,10 @@ size_info   dq 0
 
 width       dd 0
 height      dd 0
-rng_state   dq 0
-bltpix      dd 0
+rowbytes    dd 0
+cur_y       dd 0
 
+rng_state   dq 0
 blt_mark    db 0
 
 banner      dw 'U','E','F','I',' ','G','O','P',' ','R','U','N',13,10,0
@@ -249,4 +282,11 @@ GOP_GUID:
     dd 0x9042A9DE
     dw 0x23DC, 0x4A38
     db 0x96,0xFB,0x7A,0xDE,0xD0,0x80,0x51,0x6A
+
+; -------------- ROW BUFFER --------------
+section .bss
+align 16
+; 32 KiB row buffer → up to 8192 pixels per row (8192*4 = 32768 bytes).
+; If your mode is wider, increase this (e.g., resb 65536 for up to 16384 px).
+rowbuf  resb 32768
 
