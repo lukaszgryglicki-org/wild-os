@@ -1,0 +1,1 @@
+rm *.EFI *.img *.obj
